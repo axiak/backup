@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+import os
+import sys
+import stat
+import time
+import shutil
+import socket
+import datetime
+import tempfile
+import subprocess
+
+try:
+    input = raw_input
+except NameError:
+    pass
+
+
+HOSTNAME = socket.gethostname().split('.')[0]
+
+
+def main():
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+    else:
+        arg = ''
+
+    sys.exit({
+        'backup': backup,
+        'restore': restore,
+        'verify': verify,
+    }.get(arg, default)() or 0)
+
+
+def default():
+    print("Usage: {0} backup|restore|verify".format(sys.argv[0]))
+    return 1
+
+def backup():
+    mount = get_mount()
+    verify_mount(mount)
+    target_root = os.path.join(mount, HOSTNAME.lower())
+    backups = parse_backup_config()
+    if not confirm_backup(backups, target_root):
+        return -1
+    for root, exclusions in backups.items():
+        rsync_backup(root, target_root, exclusions)
+
+    write_backup_record(mount)
+    copy_to_mount(mount)
+    subprocess.check_call('sync', shell=True)
+
+def write_backup_record(mount):
+    md5sum = compute_target_md5sum(mount)
+    with open(record_file(mount), 'w+') as f:
+        output = md5sum + '\n' + str(int(time.time())) + '\n'
+        f.write(output)
+
+
+def read_backup_record(mount):
+    try:
+        with open(record_file(mount), 'r') as f:
+            lines = f.read().split('\n')
+            return {
+                'md5sum': lines[0].strip(),
+                'time': int(lines[1].strip())
+            }
+    except:
+        return {}
+
+def record_file(mount):
+    return os.path.join(mount, '.backup-' + HOSTNAME.lower())
+
+
+def compute_target_md5sum(mount):
+    target_root = os.path.join(mount, HOSTNAME.lower())
+    return subprocess.check_output('tar c {0} | md5sum'.format(target_root),
+                                   shell=True).decode('utf-8').split()[0].strip()
+
+
+def verify():
+    return verify_mount(get_mount())
+
+def copy_to_mount(mount):
+    shutil.copy2(os.path.realpath(__file__), mount)
+    shutil.copy2(config_path(), os.path.join(mount, HOSTNAME + "_backup.cfg"))
+
+def verify_mount(mount):
+    old_data = read_backup_record(mount)
+    if not old_data:
+        print("There was no backup record!")
+        return 1
+    last_backup = datetime.datetime.fromtimestamp(old_data['time'])
+    print("The last backup was on {0}. {1} days ago!".format(
+        last_backup,
+        (datetime.datetime.now() - last_backup).days
+    ))
+
+    print("Computing md5 sum...")
+    md5sum = compute_target_md5sum(mount)
+    if md5sum == old_data['md5sum']:
+        print("Looks like your signature matches!")
+    else:
+        print("Uh oh.. we might have data corruption on our hands.")
+        return 1
+
+
+def restore():
+    print("RESTORE!")
+
+
+def confirm_backup(backups, target_root):
+    print("We will process the following directories:")
+    for root, exclusions in backups.items():
+        print("  {0} -> {1}".format(root, target_dir(target_root, root)))
+        for exclusion in exclusions:
+            print("    (excluding {0})".format(exclusion))
+        print("")
+    if input("Do you want to continue? [y/n] ").lower().startswith('y'):
+        return True
+    else:
+        return False
+
+def rsync_backup(root, target_root, exclusions):
+    cmd = ['rsync', '-avP', '--delete']
+    target = target_dir(target_root, root)
+    target_parent = os.path.dirname(target)
+    try:
+        os.makedirs(target_parent)
+    except:
+        pass
+    if exclusions:
+        with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as ef:
+            for exclusion in exclusions:
+                ef.write((exclusion[len(root):] + "\n").encode('utf-8'))
+            ef.flush()
+            cmd.extend(['--exclude-from', ef.name])
+    cmd.append(root)
+    cmd.append(target_parent)
+    subprocess.check_call(cmd)
+    subprocess.check_call('sync', shell=True)
+
+
+def target_dir(root, path):
+    return os.path.join(root, path.lstrip('/'))
+
+def config_path():
+    return os.path.join(os.environ['HOME'], "backup.cfg")
+
+def parse_backup_config():
+    try:
+        with open(config_path(), 'r') as f:
+            contents = f.read().split('\n')
+    except:
+        raise Exception("Could not parse config file. Are you sure {0} exists?".format(config_path))
+
+    HOME = os.environ['HOME']
+
+    roots = {}
+    negatives = []
+    for line in contents:
+        line = line.split('#', 1)[0].strip()
+        if not line:
+            continue
+        line = line.replace('~', HOME).replace("$HOME", HOME)
+        if line.startswith('-'):
+            negatives.append(line[1:].strip())
+            continue
+        roots[line] = set()
+    
+    for negative in negatives:
+        for root, negative_set in roots.items():
+            if negative.startswith(root):
+                negative_set.add(negative)
+                break
+        else:
+            raise Exception("Cannot find root for negative match: {0}".format(negative))
+    return roots
+        
+        
+    
+
+
+def get_mount():
+    mounts = get_mounts()
+    preferred = preferred_mount(mounts)
+    print("Please pick a mount for your drive (* is default):")
+    for i, mount in enumerate(mounts):
+        print(" [{0}] - {1}{2}".format(i, mount, ' *' if i == preferred else ''))
+    while True:
+        picked = input("\nPick a mount above [{0}]: ".format(preferred))
+        if not picked.strip():
+            picked = str(preferred)
+        try:
+            mount = mounts[int(picked.strip())]
+            print("Using {0}!\n".format(mount))
+            return mount
+        except:
+            pass
+
+def preferred_mount(mounts):
+    return max((os.stat(mount).st_dev, i)
+               for i, mount in enumerate(mounts))[1]
+
+        
+
+def get_mounts():
+    mounts = []
+    for line in subprocess.check_output('mount', shell=True).decode('utf-8').split('\n'):
+        row = line.strip().split()
+        if len(row) < 3 or row[1] != 'on':
+            continue
+        mount = row[2]
+        if any(x in mount for x in
+               ('/sys', '/dev', '/run', '/proc', '/boot')):
+            continue
+        if mount == '/':
+            continue
+        mounts.append(mount)
+    return sorted(mounts)
+
+if __name__ == '__main__':
+    main()
